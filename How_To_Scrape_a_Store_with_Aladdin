@@ -1,0 +1,697 @@
+# How To Scrape a Store with Aladdin
+
+## Part I: A high level overview of scraping with aladdin
+
+### 1. What to scrape?
+
+Project Aladdin (referred to as aladdin for brevity below) scrapes a store website by the navigation menu links which are common on today's websites. For each navigation menu link (which is referred to as category link in aladdin terminology and links to a product listing page, and in this document it's simply called a category for brevity), it tries to traverse all pages under that menu through the pagination controls. And on each category page, aladdin uses a product matcher to extract sale records, each of which contains these data points:
+- sale name
+- sale price
+- image url
+- detail page url
+- stock status (-1: discontinued, 0: out-of-stock, 1: in-stock, 2: pre-order)
+which will then be collected into the aladdin scraper database.
+
+### 2. What tools are used?
+
+Internally, aladdin uses
+- Python 3 for all scraping logic
+- [Scrapy](https://scrapy.org/) framework to drive the scraping (already included in the distros)
+- [Selenium](https://www.selenium.dev/documentation/en/webdriv	r/) webdriver for manupulating web browser (already included in the distros)
+- Google Chrome for fetching page source where required
+- [chromedriver](https://chromedriver.chromium.org/) for allowing Selenium webdriver to talk to Google Chrome browser
+- [xvfb] for running Chrome browser in headless mode with full features
+
+**Note: The required platform is Ubuntu 20.04 (x86_64).**
+
+### 3. How to scrape?
+
+Scraping all sale(sometimes refered to as *deal* or *product* below, they are all the same thing from scraping perspective. But note that in the aladdin database, product specifically means a manufacturer product, whereas sale/deal means a vendor product listing, so multiple sale records may point to the same product record.) records from a store website involves these 2 main tasks:
+- the fetch of category links from a home page url
+- the travesal of each category link (which points to a deal listing page)
+
+And these 2 main tasks translate to these 3 engineering problems:
+
+- parse the category link structure information from the home/start page source code, to collect links like these examples on the **Shop All Products** menu on https://www.harveynorman.com.au/:
+  - [Computers & Laptops > Laptops](https://www.harveynorman.com.au/computers-tablets/computers/laptops)
+  - [Computers & Laptops > 2-in-1 PCs](https://www.harveynorman.com.au/computers-tablets/computers/2-in-1)
+  - [Computers & Laptops > ...]()
+  - [Phones, Accessories & GPS > Unlocked Mobile Phones](https://www.harveynorman.com.au/phones-accessories-gps/phones-phablets/unlocked-mobile-phones)
+  - [Phones, Accessories & GPS > iPhones](https://www.harveynorman.com.au/phones-accessories-gps/phones-phablets/iphones)
+  - ...
+  
+- parse the sale record structure information on a category page. Again using harveynorman [Computers & Laptops > Laptops](https://www.harveynorman.com.au/computers-tablets/computers/laptops) category page as an example, we want to locate the items in the sale grid for these records:
+  - HP 14-inch Celeron-N4020/4GB/64GB eMMC Laptop
+  - Acer Aspire 5 14-inch i3-8130U/4GB/128GB SSD Laptop
+  - HP 15.6-inch i7-1065G7/8GB/512GB SSD Laptop
+  - ...
+  
+  And within each of them, we want to know the name, price, image url, detail page url... etc
+  
+- parse the pagination structure information on a category page, so that the scraper can move on to the next page in current category. In the example of [Computers & Laptops > Laptops](https://www.harveynorman.com.au/computers-tablets/computers/laptops) page, we want to locate the pagination row below the sale grid: `*1*` `2` `3` `4` `5` `>`, and collect the next page button's(`>`) url, so after current page is done, we can move on to the next page.
+
+All of these problems involve locating html elements in the page source, and that's achieved using [xpath](https://www.w3schools.com/xml/xml_xpath.asp). Here are two examples
+- if we want to locate the first sale record (which is named *HP 14-inch Celeron-N4020/4GB/64GB eMMC Laptop*, in above harveynorman laptops category page), we can use below xpath:
+```
+//div[@id='category-grid']/div[@class='product-item'][1]
+```
+which literally means:
+```
+select the first 'div' tag with class 'product-item' under the 'div' tag with id 'category-grid'
+```
+- if we want to locate all the sale records, then this path would do (note: the trailing `[]` containing a number is omitted):
+```
+//div[@id='category-grid']/div[@class='product-item']
+```
+
+### 4. What to have in python code to scrape a store?
+
+Aladdin uses one spider for each store website to scrape their sale records. So scraping a store means creating a spider, which defines how those problems are addressed for the store with a set of xpaths in 3 groups below:
+
+#### Category start link retrieval
+- **category_xpath**: selects the category links from:
+  - usually the navigation menu from the home page of the store, or
+  - in case the home page doesn't have a clear navigation menu, then another page that lists all the navigational links to all sales information on the store, such as sitemap page.
+#### Category sale record retrieval
+- **product_xpath**: for selecting the product (or sale rather...) records from a category page (whose url is extracted using the `category_xpath` above)
+- **name_xpath**: selects the sale name **within** a sale record (so it's relative to the `product_xpath` xpath. Same for following xpaths related to a sale record, unless stated otherwise)
+- **brand_xpath**: for the brand of a sale record
+- **price**: this is a bit special, due to complexity with price info within a sale record, where there can be noise currency elements together with the real sale price. As such, it's handled by checking all possible currency elements, so not tied to a particular xpath.
+- **image_url_xpath**: for getting the image url of a sale record
+- **url_xpath**: for getting the detail page url of a sale record
+#### Category navigation link retrieval
+Every store category page is built differently, but they usually adopt one or more of these types of pagination methods:
+- direct page links including next page link, all with a normal url, as is case of harveynorman.
+- lazy loading: more sale records are loaded into current page as it is scrolled close to the bottom.
+- loading-more button: more sale records are loaded into current page when user clicks the loading-more button.
+For stores using the latter 2 methods, aladdin uses selenium to handle the scraping for them.
+(Note: some stores may use lazy loading and loading-more button at the same time!)
+
+And these map to the below data points we want to have in python code:
+- **next_page_xpath**: for getting the next page url relative to current category page
+- **has_product_lazy_loading**: boolean value indicating whether the store's category page supports lazy loading.
+- **product_loading_more_xpath**: for getting the loading-more button
+
+## Part II: How to create a spider in python?
+
+Based on whats explained in section [4. What to have in python code to scrape a store](https://github.com/binfe/aladdin-core/new/master#4-what-to-have-in-python-code-to-scrape-a-store), we need to figure out all the important xpaths and related flags and put them in a python spider file. And basically there are two methods of figuring out the xpaths.
+
+### 1. The automatic method
+
+Aladdin has some sophisticated algorithm built in to scrape many stores in a generic way, in order to detect those xpaths via some internal parsers:
+- category parser: to extract category links
+- product parser: to create product matchers which themselves can extract sale records from a category page
+
+### 2. The hybrid (automatic + manual) method
+
+This method has to be used when the automatic method fails for a particular store, at any of the xpaths listed in section [4. What to have in python code to scrape a store?](#4-what-to-have-in-python-code-to-scrape-a-store). And then we need to do some manually find out the correct value for the failing xpath, and provide it as a hint for the parsers, on top of the automatic method.
+
+### 3. What a spider file looks like?
+
+A spider file can be as simple as around just 10 lines of code, or can go beyond a few hundreds of lines.
+At its core, a spider file, as a python file, must define a python class(which should have a unique class name obviously), subclassing from `BaseMatcherSpider` with these required attributes:
+- **name**: the **internal name** of the spider, which is used to identify the spider and the store in all related code. Lower case string starting with an English letter. This name must also match the spider file name (without the `.py` extension)
+- **allowed_domains**: a list of domains to ensure the spider only scrape pages matching these domains. Usually it's the **store_website** below without the protocol & path
+- **startUrl**: the start url for the scraping session. 
+  Usually it's the same as the **store_website** attribute below. But in some cases, the store_website link may not have the proper navigation menu structure, and an alternative link on the store may be used. An example is the ebayau scraper, which currently has a startUrl attribute different than the **store_website** attribute.
+- **store_name**: the official store name for customers.
+- **store_website**: the home page for the store for customers.
+- **needsBrowser**: boolean value indicating whether this store requires a browser for the spider to function. For most stores it's yes, so safe to leave it `True`.
+
+Besides above, when there is any manual fixes required to help the parsers, optional extra attributes will be set as needed:
+
+- **forced_category_xpath**: for getting the category links from a start page
+- **forced_product_xpath**: for getting the product records within a category page
+- **forced_brand_xpath** (str or tuple): for getting brand of a product element within a category page, so must be relative to forced_product_xpath. If it is a `str`, then it is just `xpath`. If it is `tuple`, the first element is `xpath` and the second element is the `key` in the JSON structure which was pointed by first element's `xpath`.
+- **forced_name_xpath** (str or tuple): for getting name of a product element within a category page, so must be relative to forced_product_xpath. If it is a `str`, then it is just `xpath`. If it is `tuple`, the first element is `xpath` and the second element is the `key` in the JSON structure which was pointed by first element's `xpath`.
+- **forced_pagination_xpaths**: a (current_page_index_xpath, next_page_xpath) tuple, of which either xpath can be left `None` to default to the parsed value. For getting current page index, and next page url on a category page.
+  - Special note on the second component `next_page_xpath`: if you set `False` on this element, it will disable the automatically generated next page xpath. This is useful when the actual pagination needs to be done with `forced_loading_more_xpath` instead.
+- **forced_loading_more_xpath**: for getting the loading-more button
+- **lazy_load_xpath**: When this value has been set, the page will scroll to the bottom of the element of this xpath. Normally the xpath should point to the product list. Only when the auto-detect fails to detect lazy load should you set this xpath.
+- **forced_image_xpath**: for getting image of a product element within a category page, so must be relative to forced_product_xpath.
+  - If any html elements in the xpath have attributes name containing `lazy`, `delay`, add this attribute to the xpath can reslove image missing issue
+    For example, an orginal image xpath is `".//div[contains(@class, 'main-img')]//picture//source"` which occurred image missing issue, after fix, the xpath is `".//div[contains(@class, 'main-img') and contains(@class, 'pr_lazy_img')]//picture//source"`
+- **forced_price_xpath**: for getting price of a product element within a category page, so must be relative to forced_product_xpath.
+- **forced_product_url_xpath**: for getting url of a product element within a category page, so must be relative to forced_product_xpath.
+- **forced_modal_close_xpath**: for getting the close button in a pop up modal which cannot be automatically dismissed. If the modal does not influence **click** on the page or **fetch data** form the page, you may ignore it.
+- **has_product_lazy_loading**: Defaults to `None`. When not None, this value will override any generated product matcher's 'has_product_lazy_loading' attribute.
+- **skip_test_pagination_lazyload_and_loadmore**: When this value is True, the site test will skip the the test on pagination/lazy load/load more
+- (Optional) price_text_class_exclusion_regex: Regex pattern for classes to exclude when extracting price.
+  Sometimes the deal price may spread across multiple tags, which are under the same ancestor tag, with also some unwanted tags underneath.
+  Here is an example:
+```
+  <span class="product-pricing-info" role="text" data-ng-if="::!product.price.isNaN">
+      <span class="price-container">
+          <span class="accessibility-inline" data-ng-if="::product.hasRoundelPromo">regular price</span>
+          <span class="currency-sign">$</span><span class="dollar-value" data-ng-bind="::product.price.dollarValue">4</span><span class="cent-value">.00</span>
+          <span class="price-suffix" data-ng-if="::product.hasRoundelPromo &amp;&amp; !product.isWeightedItem">
+          <span aria-hidden="true">ea</span>
+          <span class="accessibility-inline">each</span>
+          </span>
+      </span>
+  </span>
+```
+  In this case, the target price tag could be the `span` with class "price-container", but we don't want the texts "regular price" and "each" to be collected for price parsing, as they would fail the price noise text validation due to too many non-price chars. To workaround this issue, we can exclude the unwanted texts by their classes here, by setting `price_text_class_exclusion_regex = "accessibility-inline"`. When multiple tag classes need to be excluded, use the regex format like "class1|class2|..."
+
+#### See these 2 simple examples for reference:
+- **Example 1**: a spider file solely using the automatic method
+
+  The spider file [chemistwh.py](./Crawlers/Crawlers/spiders/chemistwh.py) defines the spider to scrape the Chemist Warehouse website:
+```python
+# -*- coding: utf-8 -*-
+
+from Crawlers.spiders.base_matcher_spider import *
+from Experiment.matchers import ProductFieldMatcher, PriceMatcher
+
+class ChemistWarehouseSpider(BaseMatcherSpider):
+    name = "chemistwh"
+    allowed_domains = ["www.chemistwarehouse.com.au"]
+    startUrl = "https://www.chemistwarehouse.com.au"
+    store_name = "Chemist Warehouse"
+    store_website = "https://www.chemistwarehouse.com.au"
+
+    needsBrowser = True
+```
+
+- **Example 2**: a spider file using the hybrid method
+
+  The spider file [princesspolly.py](./Crawlers/Crawlers/spiders/princesspolly.py) defines the spider to scrape the Princess Polly website:
+
+```python
+# -*- coding: utf-8 -*-
+
+from Crawlers.spiders.base_matcher_spider import *
+from Experiment.matchers import ProductFieldMatcher, PriceMatcher
+
+class PrincessPollySpider(BaseMatcherSpider):
+    name = "princesspolly"
+    allowed_domains = ["www.princesspolly.com.au"]
+    startUrl = "https://www.princesspolly.com.au"
+    store_name = "Princess Polly"
+    store_website = "https://www.princesspolly.com.au"
+
+    needsBrowser = True
+    # (Note: for the sake of easier explaining, I've omitted a few lines code that's not very interesting here)
+    ...
+
+    #<-carry-over-begin->
+    forced_category_xpath = "//nav//a[contains(@class, 'nav__link')]"
+    forced_product_xpath = "//main[@id='MainContent']//div[@class='product-tiles']/div[contains(@class,'product-tile')]"
+    #<-carry-over-end->
+```
+Note that the automatic parsers fail at **category_xpath** and **product_xpath**, so we have to give them some hints, by setting the **forced_category_xpath** attribute & **forced_product_xpath** respectively.
+
+## Part III: Spider creation in action!
+
+Obviously it's preferable to use the automatic way whenever possible. And only when it has difficulties with certain xpaths, do we make some manual fixes to it, as shown in the `princesspolly` spider in previous section.
+
+Now I'll use the Harvey Norman website (https://www.harveynorman.com.au/) as an example to show the general steps to creating a spider.
+
+### 0. Pre-requisite: Ubuntu 20.04 + aladdinx tools + Google Chrome + chromedriver setup
+
+Note: currently aladdin command only supports Linux platforms.
+
+- Unzip the aladdinx-1.x.zip file in your workspace e.g. /home/someuser/workspace/aladdinx
+- Install xvfb package on Ubuntu
+- Google Chrome: install latest version to the default location on your platform
+- chromedriver: install the chromedriver version from https://chromedriver.chromium.org that matches the installed Google Chrome browser version.
+
+### 1. Check if the category links can be parsed automatically with aladdin.
+
+Now we can invoke the `aladdin` command to try out the automatic parsing method.
+(Hint: it'd be much more convenient to add the `/home/someuser/workspace/aladdinx` folder to `PATH` env var, in order to run `aladdin*` commands from any folder)
+
+Firstly, we need to have a look at the Harvey Norman homepage https://www.harveynorman.com.au/, to see if there is any obvious navigation menu structure.
+As mentioned earlier, it does. So we can give the homepage a go to try out the automatic category parsing. This is done by running below command in terminal:
+```
+aladdin-parser categorise https://www.harveynorman.com.au/
+```
+Then give it a few seconds, and hopefully it should print out a lot of information like this in terminal:
+```
+Sample category links for category url xpath [/html/body/div[@id='outer-wrap']/div[@id='wrapper']/div[@class='main-nav-wrapper']/div[@class='container']/div[@class='row']/div[re:test(@class, 'col-md-[0-9]+ nav-md-list js-menu collapse in')]/ul[@class='list top-level-nav nav-list']//a[not(ancestor-or-self::*[name() != 'body' and (re:test(@class, 'foot|currency', 'i') or re:test(@id, 'foot', 'i'))]) and not(following-sibling::*[1]//a)]]:
+[('Home', 'https://www.harveynorman.com.au/'), ('Lenovo Smart Clock Essential', 'https://www.harveynorman.com.au/lenovo-smart-clock-essential.html'), ('Braun Silk-Epil Series 7 7/890 SensoSmart Wet and Dry Epilator - White/Silver', 'https://www.harveynorman.com.au/braun-silk-epil-series-7-7-890-sensosmart-wet-and-dry-epilator-white-silver.html'), ('Contact us for price', 'https://www.harveynorman.com.au/fitbit-versa-lite-edition-fitness-tracker.html#request-a-price'), ('Fitbit Versa Lite Edition Fitness Tracker', 'https://www.harveynorman.com.au/fitbit-versa-lite-edition-fitness-tracker.html'), ('SEE MORE HOT DEALS & OFFERS\xa0', 'https://www.harveynorman.com.au/hot-deals'), ('Breville the Easy Air Purifier', 'https://www.harveynorman.com.au/breville-the-easy-air-purifier.html'), ('Dyson Cinetic Big Ball Animal Pro Barrel Vacuum Cleaner', 'https://www.harveynorman.com.au/dyson-cinetic-big-ball-animal-pro-barrel-vacuum-cleaner.html'), ('Sunbeam Mini Bake & Grill Compact Oven', 'https://www.harveynorman.com.au/sunbeam-mini-bake-grill-compact-oven.html'), ('Laptops', 'https://www.harveynorman.com.au/computers-tablets/computers/laptops'), ('2-in-1 PCs', 'https://www.harveynorman.com.au/computers-tablets/computers/2-in-1'), ('Microsoft Surface', 'https://www.harveynorman.com.au/computers-tablets/computers/microsoft-surface'), ('Modern PCs', 'https://www.harveynorman.com.au/computers-tablets/computers/modern-pcs'), ('Apple Mac Computers', 'https://www.harveynorman.com.au/computers-tablets/computers/apple-mac-computers'), ('Gaming PCs & VRs', 'https://www.harveynorman.com.au/computers-tablets/computers/gaming-pc-and-vr'),...
+```
+So that's a good sign, showing that the automatic method found the xpath:
+```
+/html/body/div[@id='outer-wrap']/div[@id='wrapper']/div[@class='main-nav-wrapper']/div[@class='container']/div[@class='row']/div[re:test(@class, 'col-md-[0-9]+ nav-md-list js-menu collapse in')]/ul[@class='list top-level-nav nav-list']//a[not(ancestor-or-self::*[name() != 'body' and (re:test(@class, 'foot|currency', 'i') or re:test(@id, 'foot', 'i'))]) and not(following-sibling::*[1]//a)]
+```
+(Yes, it's a super complex xpath in this case...)
+and a long list of found category links in (name, url) tuples.
+
+#### Side note 1
+Some of the sample category links in the output above, like the first one 'Home', which happens to be the same url as the store home page (which in turn hopefully will be the **startUrl** of the spider as well). It may raise an alarm that this may lead to a loop (as in, **startUrl** -> category link scraping with 'Home' -> **startUrl** ...), but not really, for 2 reasons:
+- the scraping flow is designed to always start from **startUrl**, and then move on to the individual category links one by one, and for each category link, traversing through all the pages in it, there is no back-tracking in this flow.
+- when creating a spider using the **BaseMatcherSpider** as a base class, we get category filtering (and dedupping) for free, and this should remove any category link that points to the **startUrl**.
+
+#### Side note 2
+Regarding multi-leveled navigation menu which are used on almost all store websites, like the Harvey Norman site:
+- it's desirable to only collect the bottom level menu links as category links, as the higher level menus (e.g. the parent menus) are merely just aggregating multiple sub-menus' sale records, and collecting all the sub-menus should cover what's in the higher level menus.
+- some navigation menu detail panes may include links like "See all in xxx" or "See all", these are simply duplicating the parent menu, and as a result are ignored automatically by the automatic parser.
+
+### 2. [Optional] Manually find out the category link xpath when the above automatic method fails
+
+There is 2 scenarios where we would want to manually find out the category link xpath:
+- the automatic method is missing some or a lot of category links that we can see in a browser page, or
+- it just can't find any category link at all
+
+Then it's time to manually find out the xpath. I'll still use the Harvey Norman home page https://www.harveynorman.com.au/ as an example, even though the automatic parser can handle it well.
+- Open https://www.harveynorman.com.au/ in Chrome
+- [Optional] click or hover over top navigation button to reveal the top navigation menu. This step is optional and needed only for those websites that don't show the menu by default and require user interaction to trigger it. In the case of Harvey Norman home page, it's displayed by default, so this step is not necessary.
+- Hover over each top level menu item, to see if that triggers the next level menu. In this case all the menus trigger their second level menus.
+  **Note**: as explained in [Side note 2](#side-note-2) earlier, the already seen top level menu items (`Computers & Tablets` `Phones, Accessories & GPS` `Cameras, Printers & PhotoCentre` `Games Central` `Smart Home` `...`) are not the most interesting part for us (though they do serve some purpose for some tasks elsewhere)
+  Now take the `Computers & Tablets` top menu as an example, hovering over it shows its level 2 menu with these links: `Laptops` `2-in-1 PCs` `Microsoft Surface` `Modern PCs` `Apple Mac Computers` `Gaming PCs & VRs` `Chromebooks` `Networking` `Modems & Routers` `Wifi Range Extenders` `...`. And they are exactly what we want. Move cursor to one of the level 2 menus, say... `Laptops`, and right click on this link, and choose `Inspect` menu, as shown below:
+  ![inspect-category-link-element](https://aladdin-misc.s3-ap-southeast-2.amazonaws.com/public/hn-level1-level2-nav-menu-show-inspector.png)
+- Then we should see this menu's tag (hopefully it's a anchor tag if you can see the link appearing in the status bar of Chrome) displayed in Chrome's DOM inspector view like below:
+  ![category-link-element-in-dom](https://aladdin-misc.s3-ap-southeast-2.amazonaws.com/public/find-category-link-xpath.png)
+
+From above view, we can compose the xpath to use for parsing category links. Some possible xpaths are:
+  - a concise one: `//div[@class='main-nav-wrapper']//li[@class='level2']/a`
+  - a really verbose one: `//div[@class='main-nav-wrapper']/ul[contains(@class, 'top-level-nav')]/li[contains(@class,'level0')]/ul[contains(@class, 'nav-hover-container')]/li[@class='nav-hover']/ul[contains(@class,'nav-list')]/li[contains(@class,'level1')]/ul/li[@class='level2']/a`
+
+Both versions can select all the bottom level menu links like the `Laptops` one. And here I'm deliberately ignoring any traits that's specific to a particular bottom level menu link:
+  - no trailing `[_number_]` marker at the end, so that all sibling anchor tags are selected, and
+  - all filtering criteria on the whole paths (in both the concise one and the verbose one) are generic to all possible bottom menu links across all top level menus
+
+So that either xpath can achieve our goal to select all the bottom level links like `Laptops`
+Also, there can be a lot of different xpaths that could achieve the same goal, by taking different intermediate nodes. However, between the concise xpath and the verbose xpath above (and probably any other possible alternative xpaths in this particular case), the former should be adopted, as it has these advantages over the rest:
+  - concise yet determinate enough
+  - more tolerant to website structure changes
+  - less error prone
+
+That being said, extra care needs to be taken to make the xpath concise. A bad example is such an xpath: `//div[@class='main-nav-wrapper']//li/a`. Though it's more concise than the one given above (without the [@class='level2'] filtering on the `li` tag), it however selects any `a` under a `li` below `div[@class='main-nav-wrapper']`, which means it would match menu link from all levels, and that's not what we want.
+
+Ok, that's it! If the automatic parser hadn't worked, we could now use the concise xpath `//div[@class='main-nav-wrapper']//li[@class='level2']/a` as the value for `forced_category_xpath` attribute of the spider to be created.
+
+### 3. Check if the product records and pagination information can be parsed automatically with aladdin
+
+```
+aladdin-parser productise -x -L https://www.harveynorman.com.au/computers-tablets/computers/modern-pcs
+```
+If you are running the command throw SSH client(using headless browser), you may want to remove `-L`, which is:
+```
+aladdin-parser productise -x https://www.harveynorman.com.au/computers-tablets/computers/modern-pcs
+```
+
+Then give it a few seconds, and hopefully it should print out a lot of information like this in terminal:
+```
+Parsed current page index: 1
+Parsed next page url: https://www.harveynorman.com.au/computers-tablets/computers/modern-pcs?p=2
+Parsed product examples:
+-----------------------
+Name: Lenovo Smart Clock Essential
+Brand: None
+Price: 48.0
+Ref-Price: None
+URL: https://www.harveynorman.com.au/lenovo-smart-clock-essential.html
+Image URL: https://azcd.harveynorman.com.au/media/catalog/product/cache/21/small_image/112x63/9df78eab33525d08d6e5fb8d27136e95/z/a/za740009au-lenovo-smart-clock-essential_1.jpg
+Stock: 1
+
+Name: Seagate Expansion 2TB Portable Hard Drive
+Brand: None
+Price: 88.0
+Ref-Price: None
+URL: https://www.harveynorman.com.au/seagate-expansion-2tb-portable-hard-drive-1.html
+Image URL: https://azcd.harveynorman.com.au/media/catalog/product/cache/21/small_image/112x63/9df78eab33525d08d6e5fb8d27136e95/2/_/2_5003_1_.jpg
+Stock: 1
+
+Name: Sony WF-XB700 Truly Wireless EXTRA BASS Headphones
+Brand: None
+Price: 178.0
+Ref-Price: None
+URL: https://www.harveynorman.com.au/sony-wf-xb700-truly-wireless-extra-bass-headphones.html
+Image URL: https://azcd.harveynorman.com.au/media/catalog/product/cache/21/small_image/112x63/9df78eab33525d08d6e5fb8d27136e95/w/f/wfxb700-sony-truly-wireless-extra-bass-headphones-hero.jpg
+Stock: 1
+
+...
+
+Name: Acer Nitro 5 15.6-inch i5-10300H/8GB/512GB/RTX2060 6GB Gaming Laptop
+Brand: None
+Price: 1599.0
+Ref-Price: None
+URL: https://www.harveynorman.com.au/acer-nitro-5-15-6-inch-i5-10300h-8gb-512gb-rtx2060-6gb-gaming-laptop.html
+Image URL: https://azcd.harveynorman.com.au/media/catalog/product/cache/21/small_image/205x115/9df78eab33525d08d6e5fb8d27136e95/n/h/nh.q7qsa.002-acer-nitro-5-gaming-laptop.jpg
+Stock: 1
+
+<ProductFieldMatcher 0x1221ac160:
+{   'brand_xpath': './/a[re:test(@title, '
+                   "'(^|\\W|-)brand($|\\W)')]//text()[normalize-space()]|.//*[re:test(@class, "
+                   "'(^|\\W|-)brand($|\\W)')]//text()[normalize-space()]|.//*[re:test(@itemprop, "
+                   "'(^|\\W|-)brand($|\\W)')]//text()[normalize-space()]|.//*[re:test(@class, "
+                   "'(^|\\W|-)brand($|\\W)')]//img/@alt[normalize-space()]",
+    'browser_based': True,
+    ...
+    'has_product_lazy_loading': False,
+    'image_url_xpath': [   "div[@class='photo-box']/a/img[@class='photo "
+                           "photo-category lazy']",
+                           "div[@class='photo-box']/a/img[@class='photo']"],
+    'name_xpath': 'div[3]/a/text()[normalize-space() and not(re:test(., '
+                  "'(^|\\W)(website|shipping|contact.?us|more.?info|find in "
+                  "store)(\\W|$)', 'i'))]",
+    'next_page_xpath': ...,
+    'price_matcher': {   'normal_price_xpath': None,
+                         'sale_old_price_xpath': None,
+                         'sale_price_xpath': None,
+                         'sale_saving_xpath': None},
+    'product_loading_more_xpath': None,
+    'product_xpath': "(/html/body/div[@id='outer-wrap']/div[@id='wrapper']/div[@id='main']/div[@id='page']/div[@id='category-items']/div[@id='tab-products']/div[@id='content']/div[@class='tb_content']/div[@id='category-grid']/div[@class='product-item']/div[@class='product-info-item "
+                     'panel panel_product stock-in '
+                     "cfx'])|(/html/body/div[@id='outer-wrap']/div[@id='wrapper']/div[@class='main-nav-wrapper']/div[@class='container']/div[@class='row']/div[re:test(@class, "
+                     "'col-md-[0-9]+ nav-md-list js-menu collapse "
+                     "')]/ul[@class='list top-level-nav "
+                     "nav-list']/li[re:test(@class, 'level-top type-[0-9]+ "
+                     "level[0-9]+')]/ul[re:test(@class, 'nav-hover-container "
+                     'col-md-[0-9]+ '
+                     "hot-deals-nav-wrapper')]/div[@id='navDeals']/div[@class='row "
+                     "l_mgn-b-md']/div[re:test(@class, 'col-md-[0-9]+ "
+                     "col-xs-[0-9]+')]/div)",
+    'product_xpath_extended': False,
+    'quick_parsed': False,
+    'source_hash': None,
+    'source_url': 'https://www.harveynorman.com.au/computers-tablets/computers/modern-pcs',
+    'subcategory_xpath': None,
+    'url_xpath': 'div[3]/a/text()[normalize-space() and not(re:test(., '
+                 "'(^|\\W)(website|shipping|contact.?us|more.?info|find in "
+                 "store)(\\W|$)', "
+                 "'i'))]/ancestor-or-self::a[@href][1]/@href[normalize-space()]"}
+>
+```
+
+which shows that the automatic method found the product_xpath and all the important xpaths related to a product item for all the product specific data points:
+- product_xpath: 
+  ```
+  "(/html/body/div[@id='outer-wrap']/div[@id='wrapper']/div[@id='main']/div[@id='page']/div[@id='category-items']/div[@id='tab-products']/div[@id='content']/div[@class='tb_content']/div[@id='category-grid']/div/...
+  ```
+- name_xpath
+- brand_xpath
+- image_url_xpath
+- url_xpath
+- pagination xpaths (current page index xpath, next page xpath)
+- price can be parsed correctly as well (note: there is a specific property named `price_matcher` for price parsing, which usually doesn't need to be touched, as it uses some automatic method to get price info when its normal_price_xpath/sale_old_price_xpath/sale_price_xpath/sale_saving_xpath are set to None)
+- stock status
+
+#### Side note 1
+In the ProductFieldMatcher output, the first thing to check for is `product_xpath`:
+- if it's missing, none of the rest xpaths will be correct.
+- if it's incorrect (say on a too deep child tag of the actual product item tag), it may cause image/brand/... to be missing
+So it's necessary to double check the product_xpath, by comparing it with the xpath you see on the actual product item tag using Chrome page inspector tool.
+
+#### Side note 2
+Depending on stores design, pagination may be implemented as tradition pagination methods with individual page links and/or next page links, like on harveynorman.com.au. It may also be implemented as lazy-loading (where page automatically loads more deals in the same page, as user scrolls) and/or loading-more links (where user has to click to load more deals in the same page). So that's why there is these 2 more attributes:
+- has_product_lazy_loading
+- product_loading_more_xpath
+The parser is able to detect some common lazy-loading/loading-more patterns, but not all obviously. So if you find that a page in the browser clearly has lazy-loading and/or loading-more, but the xpaths output by the parser are None, that means you need to provide these 2 xpaths attributes manually in the spider file to be generated
+
+In some cases, during the lazy-loading detection procedure, the page failed to trigger the lazy load due to it scrolling to the bottom and jumped over the position where can trigger lazy load. In this scenario, you can use this xpath `lazy_load_xpath` point to the product list, it will automatically scroll to the bottom of the list.    
+### 4. [Optional] Manually find out the product related xpaths when the above automatic method fails on any of them
+
+#### 4.1 If in step 3, the parser can NOT find the `product_xpath` correctly, then you must provide the a forced product xpath and rerun the product parsing command like this:
+
+  `aladdin-parser productise -x -L -X "//some/xpath/you_find_manually"`. And move on to step 4.2 below.
+
+```
+    # The forced product xpath to use
+    # Set this field to a pre-defined xpath in case the automatic product xpath parsing doesn't work.
+    forced_product_xpath = None
+
+    # Whether to enable express product xpath parsing. When set to True, it makes parser skip the default full product xpath parsing and use only the express parsing method, which may
+    # be helpful for situation described below.
+    #
+    # Note: usually you should leave this attribute to False. This attribute should only be considered when default product xpath parsing *partially* works:
+    # - default product xpath parsing works for individual category urls, but
+    # - it doesn't work when running the spider continuously across multiple category urls, as in, it causes wrong products to be scraped repeatedly in different categories, while those categories have their own real products available. The harveynorman spider is a real example of this issue, due to recent site update. If you run this spider with `enable_express_product_xpath_parsing attribute set to False`, after a few categories, it wouldn't scrape any new deals. And for this case, setting `enable_express_product_xpath_parsing` to True should fix this issue.
+    # - however, in cases where the product parser fails to find the correct product xpath regardless of `enable_express_product_xpath_parsing` value, you should still have to use `forced_product_xpath` attribute above.
+    enable_express_product_xpath_parsing = False
+```
+
+#### 4.2 If in step 3, the parser can find the `product_xpath` correctly, but have difficulty with the any of the rest product data points, then below attributes will be needed respectively for those missing/incorrect data points, in the final spider file to be generated:
+```
+    # Forced brand xpath
+    # Note: this xpath is for getting brand of a product element within a category page, so must be a relative xpath.
+    forced_brand_xpath = None
+
+    # Forced name  xpath
+    # Note: this xpath is for getting name of a product element within a category page, so must be a relative xpath.
+    forced_name_xpath = None
+
+    # Set this to pre-define product url xpath in case product url is unable to be fetched.
+    # Note: this xpath is for getting url of a product element within a category page, so must be a relative xpath.
+    forced_product_url_xpath = None
+
+    # The forced subcategory xpath to use
+    # Set this field to a pre-defined xpath in case the automatic subcategory xpath parsing doesn't work.
+    forced_subcategory_xpath = None
+
+    # The forced pagination xpath as a (current_page_index_xpath, next_page_xpath) tuple, of which either xpath can be left None, in which case it defaults to the parsed value.
+    forced_pagination_xpaths = None
+
+    # The forced loading more xpath
+    forced_loading_more_xpath = None
+
+    # Whether to perform load-more action before lazy loading action.
+    # May need to turn this flag on when a store's category page has both loading-more button & lazy-loading, and lazy-loading triggers after loading-more is performed.
+    load_more_before_lazy_loading = False
+```
+
+### 5. Create the spider file using `aladdin-genspider` command
+
+#### 5.1 Generate the initial spider file
+
+Run `aladdin-genspider -P -I internal_name -N store_name store_url`
+
+Help on params is available with '-h' option.
+Essentially, always use the `-P` option.
+- internal_name: The name should build by following steps:
+    1. extract the name from website domain, for example:
+        - www.example.com.au  => example
+        - www.example-site.com => example-site
+        - shop.example.com => example
+        - example_shop.com.au => example_shop
+    2. trim characters other than letters and digits, for example:
+        - example-site => examplesite
+        - example_shop => exampleshop
+    3. add Country code top-level domain like this:
+        - examplesite => examplesite-au
+        - exampleshop => exampleshop-au
+        - example => example-au
+        
+       **Please Node:** Currently we are focusing on websites in Australia, so the suffix '-au' should be added to the name. In the future, we will work on sites of other country, the suffix should change accordingly, for example, New Zealand website should be '-nz''.
+
+- store_name: The official name of the store. Usually you can find it in the `About Us` page of the footer of the store. Quotes must be used to run the command if the name contains spaces, e.g "Harvey Norman"
+- store_url: The official store home page.
+
+With the example of Harvey Norman store, we run the `aladdin-genspider` command like this:
+```
+aladdin-genspider -P -I harveynorman-au -N "Harvey Norman" https://www.harveynorman.com.au/
+```
+This will generate a `harveynorman-au.py` file in current folder.
+
+#### 5.2 Apply any overrides identified in step 2 and step 4
+
+- if the parser fails with category parsing, and you must manually find the category xpath in step 2. Then update `harveynorman.py` spider file, and add `forced_product_xpath` attribute to the spider class, with the correct xpath you find
+```python
+    class HarveyNormanSpider(BaseMatcherSpider):
+        name = "harveynorman-au"
+        ...
+        # This is the line to add
+        forced_product_xpath = "//some/real/product/xpath"
+```
+- if the parser fails with product parsing on any data points, and you must manually find the category xpath in step 4. Then also update `harveynorman.py` spider file, and add the relevant `forced_..._xpath` attributes to the spider class, with the correct xpath you find
+```python
+    class HarveyNormanSpider(BaseMatcherSpider):
+        name = "harveynorman-au"
+        ...
+
+        # Add all the necessary (as in, for the product fields that the parser fails to handle) xpath overrides
+
+        # This is the line to add, if product item xpath fix is needed
+        forced_product_xpath = "/some/product-/xpath"
+        # This is the line to add, if name parsing fix is needed
+        forced_name_xpath = "./some/product-name/xpath"
+        # This is the line to add, if brand parsing fix is needed
+        forced_brand_xpath = "./some/product-brand/xpath"
+        ...
+```
+
+### 6. Validate the generated spider with `aladdin-runspider` command
+
+To validate the generated spider, run:
+```
+aladdin-runspider -l -f ./harveynorman.py
+```
+which should print output like this:
+```
+2020-11-19 11:12:33,534 [spider.harveynorman] INFO: Using browser to fetch url: https://www.harveynorman.com.au/
+2020-11-19 11:12:38,591 [spider.harveynorman] INFO: Parsing sitemap response...
+2020-11-19 11:12:40,206 [spider.harveynorman] INFO: Using browser to fetch url: https://www.harveynorman.com.au/lenovo-smart-clock-essential.html
+2020-11-19 11:12:50,846 [spider.harveynorman] INFO: Processing category [Lenovo Smart Clock Essential] @ page 1 ...
+2020-11-19 11:12:51,834 [Crawlers.pipelines] INFO: Exported item [Lenovo Smart Clock Essential] to file.
+2020-11-19 11:12:51,912 [Crawlers.pipelines] INFO: Exported item [Seagate Expansion 2TB Portable Hard Drive] to file.
+2020-11-19 11:12:51,992 [Crawlers.pipelines] INFO: Exported item [Sony WF-XB700 Truly Wireless EXTRA BASS Headphones] to file.
+2020-11-19 11:12:52,069 [Crawlers.pipelines] INFO: Exported item [Breville the Easy Air Purifier] to file.
+2020-11-19 11:12:52,153 [Crawlers.pipelines] INFO: Exported item [Sunbeam Mini Bake & Grill Compact Oven] to file.
+2020-11-19 11:12:52,229 [Crawlers.pipelines] INFO: Exported item [Vornado Air Circulator Floor Fan - Black] to file.
+2020-11-19 11:12:52,279 [spider.harveynorman] INFO: Finished product collection in category [Lenovo Smart Clock Essential] @ page [1].
+2020-11-19 11:12:52,279 [spider.harveynorman] INFO: [!] all pages complete in [Lenovo Smart Clock Essential]
+2020-11-19 11:12:52,287 [spider.harveynorman] INFO: Using browser to fetch url: https://www.harveynorman.com.au/seagate-expansion-2tb-portable-hard-drive-1.html
+2020-11-19 11:13:03,070 [spider.harveynorman] INFO: Processing category [Seagate Expansion 2TB Portable Hard Drive] @ page 1 ...
+2020-11-19 11:13:03,138 [Crawlers.pipelines] INFO: Exported item [Lenovo Smart Clock Essential] to file.
+2020-11-19 11:13:03,202 [Crawlers.pipelines] INFO: Exported item [Seagate Expansion 2TB Portable Hard Drive] to file.
+2020-11-19 11:13:03,275 [Crawlers.pipelines] INFO: Exported item [Sony WF-XB700 Truly Wireless EXTRA BASS Headphones] to file.
+2020-11-19 11:13:03,340 [Crawlers.pipelines] INFO: Exported item [Breville the Easy Air Purifier] to file.
+...
+```
+
+#### 6.1 Validate if spider can scrape all the categories
+
+And you'll notice that, there is something wrong, as the same products are getting scraped over and over in different categories, even when scraping the category at https://www.harveynorman.com.au/computers-tablets/computers/modern-pcs, which the `aladdin-parser categorise` command was able to parse and find the deals earlier in step 3, where a lot more deals were found. In this particular case, it means there is some interference between categories, where a matcher parsed from a previous category [Lenovo Smart Clock Essential], though can find some results in subsequent category, but are also missing a lot of results. So we need to some how work around that. By using Chrome inspector and looking closer in the page structure and source code of [Lenovo Smart Clock Essential] category page, and the [Modern PCs] category page, you'll notice that, the frequently found 6 items are actually from the same noise section `More products like this`. This is not what we want, and we need to exclude those deals, as these recommendation deals will be scraped anyway in their corresponding category pages. One way to achieve that, is fix the product xpath, by setting `forced_product_xpath` as mentioned in step 5.2.
+
+Now apply the fix, and rerun step 6. If there is any more issues, fix accordingly, and repeat the step 6, until the spider can run fine:
+- it can start from the start_url (which is defined in the spider file) and
+- it can find all the category links, and
+- it can iterate through all the pages (next page, or lazy-loading, or loading-more) in the same category, and
+- it can iterate through all the category links.
+
+**A hint** for debugging a fix with a particular category page, instead of running the whole site scraping.
+- you can run `aladdin-runspider` with the additional `--dbg-category-url category-url` option to run a spider with the specified category url directly.
+
+#### 6.2 Validate if the deal items scraped contain the correct and complete data points
+
+After running the spider, you can check the `item-exports/harveynorman.txt` file in current folder, there should be lines of deal info like you see in a json like format:
+```
+{'brand': None,
+ 'category': 'Home & Garden > Home Décor > Clocks',
+ 'imageUrl': 'https://azcd.harveynorman.com.au/media/catalog/product/cache/21/small_image/112x63/9df78eab33525d08d6e5fb8d27136e95/z/a/za740009au-lenovo-s
+mart-clock-essential_1.jpg',
+ 'lastUpdate': datetime.datetime(2020, 11, 19, 11, 12, 50, 896896),
+ 'multi_offered': False,
+ 'name': 'Lenovo Smart Clock Essential',
+ 'price': 48.0,
+ 'productPage': 'https://www.harveynorman.com.au/lenovo-smart-clock-essential.html',
+ 'seller': None,
+ 'stock': 1,
+ 'storeInternalName': 'harveynorman',
+ 'storeName': 'Harvey Norman',
+ 'website': 'https://www.harveynorman.com.au/'}
+{'brand': None,
+ 'category': 'Electronics > Home Entertainment > DVD, Blu-ray & Home Cinema - '
+             'DVRs, Hard Drive Recorders',
+ 'imageUrl': 'https://azcd.harveynorman.com.au/media/catalog/product/cache/21/small_image/112x63/9df78eab33525d08d6e5fb8d27136e95/2/_/2_5003_1_.jpg',
+ 'lastUpdate': datetime.datetime(2020, 11, 19, 11, 12, 51, 885386),
+ 'multi_offered': False,
+ 'name': 'Seagate Expansion 2TB Portable Hard Drive',
+ 'price': 88.0,
+ 'productPage': 'https://www.harveynorman.com.au/seagate-expansion-2tb-portable-hard-drive-1.html',
+ 'seller': None,
+ 'stock': 1,
+ 'storeInternalName': 'harveynorman',
+ 'storeName': 'Harvey Norman',
+ 'website': 'https://www.harveynorman.com.au/'}
+ ...
+ ```
+
+ Go through at least 50 of them, to verify that:
+ - each deal contains all the data points you can see on the category page in a browser with your eyes
+ - there is no missing data point in any of the deals in the output list. This is necessary, as some websites may have lazy loaded on the data points **within** deal items (not to be confused with lazy loading **on** the deal item level). For example, it's common for websites to use lazily loaded images, where `img` tag's `src` attribute is only populated from some data attribute on the same tag, when page has been scrolled to that position. In such case, we then need to apply a fix for it too in the spider.
+
+### 7. User acceptance test of spider
+
+Now we have launch the user acceptance test for spiders. The test platform has been deployed on Jenkins. If test failed, related failure information will be appended to the Pull Request.
+The testing procedure is like this:
+- After you validated the spider, you can submit a pull request in the repo and add the label `import-testing` to this pull request. The Jenkins will automatically fetch the spider and test it.
+- If test fails:
+   - Recheck the spider according to the failure information and fix it. After the fix, you can de-label and re-label `import-testing` to the pull request. Then the new test will be triggered. 
+   - If failure information shows `Pagination, lazy-loading or load-more info is not parsed`, and you have verified that this spider don't have any of `pagination`, `lazy load`, `load more`, you can simply add `skip_test_pagination_lazyload_and_loadmore = True` to the spider to skip this. Then you need to re-trigger the test by removing and adding label `import-testing`.
+   - If failure information shows `The number of categories is less than ...`, and you have verified that this spider indeed has a small number of products below the test target, you can add `skip_test_products_number = True` in your spider to skip the test. Then re-trigger the test.
+   - If failure infromation shows `The number of categories is less than ...`, and you have verified that this spider indeed has a small amount of categories below the test target, you can add `skip_test_category_number = True` in your spider to skip the test. Then re-trigger the test.
+# Troubleshooting
+As mentioned above, the tested environment of aladdin tools is:
+```
+ubuntu 20.04 (arch x86_64)
+```
+If you would like to try a different version of ubuntu, ubuntu 18.04 is tested not working for your consideration.
+
+### Issue 1. Start error <EasyProcess cmd_param=['Xvfb', '-help'] cmd=['Xvfb', '-help'] oserror=[Errno 2] No such file or directory
+This error message usually indicates the missing package of `xvfb`. Use the following commands to install it:
+```
+sudo apt update
+sudo apt install xvfb 
+```
+If it `unable to locate package xvfb`, you may need to update your [source list](https://help.ubuntu.com/community/Repositories/CommandLine#Suggestions_.26_Recommendations). The following is Australia Source:
+```
+# See http://help.ubuntu.com/community/UpgradeNotes for how to upgrade to
+# newer versions of the distribution.
+deb http://mirror.internode.on.net/pub/ubuntu/ubuntu/ focal main restricted
+# deb-src http://mirror.internode.on.net/pub/ubuntu/ubuntu/ focal main restricted
+## Major bug fix updates produced after the final release of the
+## distribution.
+deb http://mirror.internode.on.net/pub/ubuntu/ubuntu/ focal-updates main restricted
+# deb-src http://mirror.internode.on.net/pub/ubuntu/ubuntu/ focal-updates main restricted
+## N.B. software from this repository is ENTIRELY UNSUPPORTED by the Ubuntu
+## team. Also, please note that software in universe WILL NOT receive any
+## review or updates from the Ubuntu security team.
+deb http://mirror.internode.on.net/pub/ubuntu/ubuntu/ focal universe
+# deb-src http://mirror.internode.on.net/pub/ubuntu/ubuntu/ focal universe
+deb http://mirror.internode.on.net/pub/ubuntu/ubuntu/ focal-updates universe
+# deb-src http://mirror.internode.on.net/pub/ubuntu/ubuntu/ focal-updates universe
+## N.B. software from this repository is ENTIRELY UNSUPPORTED by the Ubuntu
+## team, and may not be under a free licence. Please satisfy yourself as to
+## your rights to use the software. Also, please note that software in
+## multiverse WILL NOT receive any review or updates from the Ubuntu
+## security team.
+deb http://mirror.internode.on.net/pub/ubuntu/ubuntu/ focal multiverse
+# deb-src http://mirror.internode.on.net/pub/ubuntu/ubuntu/ focal multiverse
+deb http://mirror.internode.on.net/pub/ubuntu/ubuntu/ focal-updates multiverse
+# deb-src http://mirror.internode.on.net/pub/ubuntu/ubuntu/ focal-updates multiverse
+## N.B. software from this repository may not have been tested as
+## extensively as that contained in the main release, although it includes
+## newer versions of some applications which may provide useful features.
+## Also, please note that software in backports WILL NOT receive any review
+## or updates from the Ubuntu security team.
+deb http://mirror.internode.on.net/pub/ubuntu/ubuntu/ focal-backports main restricted universe multiverse
+# deb-src http://mirror.internode.on.net/pub/ubuntu/ubuntu/ focal-backports main restricted universe multiverse
+## Uncomment the following two lines to add software from Canonical's
+## 'partner' repository.
+## This software is not part of Ubuntu, but is offered by Canonical and the
+## respective vendors as a service to Ubuntu users.
+# deb http://archive.canonical.com/ubuntu focal partner
+# deb-src http://archive.canonical.com/ubuntu focal partner
+deb http://mirror.internode.on.net/pub/ubuntu/ubuntu/ focal-security main restricted
+# deb-src http://mirror.internode.on.net/pub/ubuntu/ubuntu/ focal-security main restricted
+deb http://mirror.internode.on.net/pub/ubuntu/ubuntu/ focal-security universe
+# deb-src http://mirror.internode.on.net/pub/ubuntu/ubuntu/ focal-security universe
+deb http://mirror.internode.on.net/pub/ubuntu/ubuntu/ focal-security multiverse
+# deb-src http://mirror.internode.on.net/pub/ubuntu/ubuntu/ focal-security multiverse
+```
+### Issue 2. The process started from chrome location /snap/bin/chromium is no longer running, so ChromeDriver is assuming that Chrome has crashed.
+This indicated that you didn't install Google chrome correctly, you need to go to google chrome website to download the chrome of Ubuntu version.
+### Issue 3. FileNotFoundError: No such file or directory: ‘chromedriver’
+This indicated that you didn't install chromedriver, you need [download it](https://sites.google.com/a/chromium.org/chromedriver/home) and put in one of your `$PATH` locations.
+
+**NOTICE: Your `Google Chrome` version should match the version of `Chromedriver`**
+### Issue 4. Part of exported products don't have image_url
+This is a general guideline of how to fix the issue.
+#### Step 1: Make sure the image xpath is correct
+- In some webpages, images of some products have different html structure (in other words, different xpath) than others. This means the xpath you are using may not able to find images in all products. So you need to extend your image xpath to ensure it can find image of all products
+
+If issue still exists, you need go to step 2
+#### Step 2: Enable lazy loading in xpath
+- In some webpages, image load has used lazy loading to somehow reduce browser resource usage. For this reason, you need to add special label in `forced_image_xpath`, you can find more in `forced_image_xpath` area in this document. 
+
+Sometimes, after you enable the lazy loading in xapth, you may find images in products are not loading because the browser didn't perform scrolling, you may go to the step 3.
+
+**A little trick to perform this fix. If you didn't find any `lazy`, `delay` keywords in the image xpath attributes. You can still add like this `"//div[contains(@class, 'main-image') or contains(@class, 'lazy-delay-class')]"/img`, even though the `lazy-delay-class` are not listed in class. You need be careful to ensure that the label `lazy-delay-class` doesn't exist in the page**
+#### Step 3: Enable browser scrolling
+- You can set `need_scroll_page_to_load_image = True` in you spider. This value will forced the page to scroll to bottom no matter what. In this way, those lazy-loading image will be loaded through the scrolling. In some rare case, image are still missing. You may go to step 4.
+#### Step 4: Enable image in browser.
+- In some rare cases, the image won't load unless you enable image in the browser. You just need to add `enableImage = True` in your spider. In some rare case, image are still missing. You may go to step 5.
+#### Step 5: Dismiss modal and slow down the scroll speed
+- In some website, there is a modal pop up which will influence image loading during scrolling. You need to dismiss it by simply setup the `forced_modal_close_xpath`. Besides of that, if images are still missing. You can try to slow down the scroll speed by setup `lazy_loading_scroll_to_top_speed`,the default value is `SCROLL_SPEED_VERY_HIGH` and available values are:
+    - SCROLL_SPEED_LIGHTNING
+    - SCROLL_SPEED_VERY_HIGH
+    - SCROLL_SPEED_HIGH
+    - SCROLL_SPEED_MEDIUM
+    - SCROLL_SPEED_LOW
+
+For example, you can try `SCROLL_SPEED_HIGH` speed by adding `lazy_loading_scroll_to_top_speed = SCROLL_SPEED_HIGH` to your spider. And base on the exported result to adjust it.
+
+**NOTICE: The above 4 steps should fix 99% cases. If you are still facing the same issue, please submit an issue in this repo to address how to reproduce the issue, I will fix it**
